@@ -1,0 +1,310 @@
+---
+
+title: "GHG-indicators.rmd"
+purpose: To calculate Indicators of Carbon Alteration
+   (1) estimate temporal changes in volume and surface area with elevation
+
+depends: 
+(1) ResOps historical daily flow, storage, and elevation data
+(2) Grand data for five TVA reservoirs
+(3) ReGeom geometry parameters
+
+author:  Y. Jager
+created:  5/28/2021
+last changed: 9/22/2023
+							
+Change history:  
+9/22/2023: Shifted from using WBM flow and temperature drivers to using historical flows from ResOps in combination with ReGeom data to simulate those indicators just related to flow (not involving temperature) for five Southeast reservoirs. 
+
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+
+#rm(list=ls())
+today <- Sys.Date()
+print(today)
+#options(java.parameters = "-Xmx2048m")
+#options(rasterTmpTime = 1); # one hour for temp files
+#options(rasterMaxMemory=1e10); # 10 GB
+options("rgdal_show_exportToProj4_warnings"="none")
+
+# Load needed libraries
+get.lib <- function(pack){
+    create.pkg <- pack[!(pack %in% installed.packages()[, "Package"])]
+    if (length(create.pkg))
+      install.packages(create.pkg, dependencies = TRUE)
+    sapply(pack, require, character.only = TRUE)
+}
+
+pks <- c('tidyverse','data.table','ggcorrplot','readxl'); #, 'nhdplusTools')
+lapply(pks, 'get.lib')
+
+# Enter path where output data are here:
+root <- "C:/Users/zij/Dropbox (ORNL)/"
+path <- paste0(root, "MyProjects/GHG emissions/")
+prog.path  <- paste0(path, "R/")
+out.path   <- paste0(path, "Results/")
+plot.path  <- paste0(path, "Plots/")
+gmlc.path <- paste0(root, "MyProjects/Grid_Modernization/")
+gmlc.data.path <- paste0(gmlc.path, "Data/")
+ghg.path <- paste0(root, "MyProjects/GHG emissions/")
+ghg.data.path <- paste0(ghg.path, "GHG-Data/")
+share.path  <- '//isilon-ops/NAOA/Projects/GLMC-WPTO/'
+
+source(paste0(prog.path, 'ReservoirFunctions.R'))
+my.print <- function(name) { paste0(name, ': ', get(name)) }
+
+```
+
+```{r TVA-data, echo=FALSE}
+
+tva.grand.ids <- c(1847,1797,1781,1770,1851)
+tva.names <- c('Guntersville','Watts Bar','Norris','Douglas','Hartwell')
+res.labels <- c('GUNT','WBAR','NORR','DGLS','HART')
+nres <- length(tva.names)
+
+```
+
+# Read ReGeom dataset and ResOps flow and storage data for TVA reservoirs
+
+```{r get-data, echo=FALSE}
+
+# Read in ResOps daily time series data for TVA and Hartwell reservoirs
+# Daily time series from https://zenodo.org/record/5893641 or WBM
+# All units are in metric with storage in million cubic meters, inflow and outflow in meters cubed per second,elevation in meters and evaporation in meters cubed per second or million cubic meters depending on the agency. The agency_attributes file has a note on the specific units of evaporation for each agency that contains evaporation data.
+resops <- list()
+kk <- 1
+for (id in tva.grand.ids) 
+{
+    resops.file <- paste0(ghg.data.path,'ResOptsUS/time_series_all/','ResOpsUS_',id,'.csv')
+    resops[[kk]] <- read.csv(resops.file, skip=0, na='NA', header=TRUE, colClasses=c('Date',rep('numeric', 5)))
+    resops[[kk]]$grand.id = id
+    resops[[kk]]$res.name = tva.names[[kk]]
+    resops[[kk]] <- resops[[kk]] %>%
+      filter(!if_all(where(is.numeric), is.na)) %>%
+      mutate(across(where(is.character), as.factor))
+    kk <- kk+1
+}
+
+if (!exists('regeom.dt')) {
+  load(file=paste0(gmlc.data.path, 'ReGeom/regeom.rdata'), verbose=TRUE)
+}
+
+
+```
+
+Model indicators (ICAs) for Southeast reservoirs
+using our calculated reservoir-specific volume - depth curves
+Calculate by year
+
+```{r ICAs, echo=FALSE}
+
+# Impute evaporation, inflow
+for (kk in 1:nres)
+{
+    # impute inflow, which is missing except for Hartwell
+    # remove dates with missing outflow
+    resops2 <- data.table(resops[[kk]])[!is.na(outflow),]
+    resops2 <- resops2[!is.na(storage),]
+    resops2[, year := year(date)][, jday := lubridate::yday(date)]
+    resops2[, ndays := .N, by=year]
+    resops2 <- resops2[ndays>=365,]
+
+    ts.out  <- sim.inflow.ts(ts.in=resops2)
+    resops[[kk]] <- ts.out
+}
+resops1 <- resops
+
+##----------------------------------------------------
+## impute inflow and use geometry to estimate depth
+##      surface area, and littoral area
+##----------------------------------------------------
+# ReGeom: depth - area - volume, sorted from bottom to top
+for (kk in 1:nres)
+{
+    gparms    <- subset(regeom.dt, GRAND_ID== tva.grand.ids[[kk]])
+    lookup.dt <- data.table(get.lookup(gparms, nlayers=30, increasing=TRUE))
+    ts.out    <- sim.littoral.ts(resops1[[kk]], lookup.dt) 
+    resops[[kk]] <- ts.out
+}
+
+##----------------------------------------------------
+## Calculate the following indicators:
+## 1. draw_area
+## 2. draw_frac
+## 3. aspect_ratio
+##----------------------------------------------------
+ICA <- list()
+for (kk in 1:nres)
+{
+    ICA[[kk]] <- get.indicators(ts.in=resops[[kk]], by.year=TRUE) %>%
+      mutate(res.name = tva.names[[kk]],
+             grand.id = tva.grand.ids[[kk]],
+             res.label = res.labels[[kk]]
+      )
+}
+ICA.dt <- rbindlist(ICA, fill=TRUE)
+
+# Quantify seasonal drawdown
+DCA <- list()
+for (kk in 1:nres)
+{
+   ts.in <- resops[[kk]] #%>% filter(year==1941)  
+	   #plot(y=ts.in$elevation, x=ts.in$jday)
+   Xc  = quantile(ts.in$elevation, probs=c(0.5), na.rm=TRUE)
+	 # using the tie package below to return multiple indicators from get.runs
+   DCA[[kk]] = ts.in %>%
+	    group_by(year) %>%
+  		bow( tie(ndrops, draw_dur, low_day_frac, fpool_dur, nrises) := get.runs(elevation, Xc) )    %>%
+      mutate(res.name  = tva.names[[kk]],
+             grand.id  = tva.grand.ids[[kk]],
+             res.label = res.labels[[kk]]
+      )
+}
+DCA.dt <- rbindlist(DCA, fill=TRUE)
+
+wide.dt <- merge(ICA.dt, DCA.dt, by=c('res.name', 'res.label', 'grand.id', 'year')) 
+
+RAMP1 <- list()
+for (kk in 1:nres)
+{
+	 ts.in <- resops[[kk]]
+	 # using the tie package below to return multiple indicators from get.runs
+   RAMP1[[kk]] = ts.in %>%
+	    group_by(year) %>%
+  		bow( tie(draw_days, start_draw, end_draw, draw_rate) := get.ramps(elevation, direction=-1) ) %>%
+   mutate(res.name  = tva.names[[kk]],
+          grand.id  = tva.grand.ids[[kk]],
+          res.label = res.labels[[kk]]
+   )   
+}
+RAMP1.dt <- rbindlist(RAMP1, fill=TRUE)
+
+RAMP2 <- list()
+for (kk in 1:nres)
+{
+	 ts.in <- resops[[kk]]
+   RAMP2[[kk]] = ts.in %>%
+	    group_by(year) %>%
+  		bow( tie(fill_days, start_fill, end_fill, fill_rate) := get.ramps(elevation, direction=1) ) %>%
+      mutate(res.name  = tva.names[[kk]],
+             grand.id  = tva.grand.ids[[kk]],
+             res.label = res.labels[[kk]]
+      )
+}
+RAMP2.dt <- rbindlist(RAMP2, fill=TRUE)
+
+runs.dt <- merge(RAMP1.dt, RAMP2.dt, by=c('res.name', 'res.label', 'grand.id', 'year'))
+
+ICA_wide.dt <- merge(wide.dt, runs.dt, by=c('res.name', 'res.label', 'grand.id', 'year'))
+
+
+```
+
+
+```{r plot.ICAs, echo=FALSE}
+
+names <- c('draw_area','draw_frac','aspect_ratio', 'ndrops','draw_dur','low_day_frac', 'draw_rate', 'fill_rate')
+plot.dt <- ICA_wide.dt %>%
+   pivot_longer(cols=names, values_to='value', names_to='indicator')
+
+P <- ggplot(data=plot.dt, aes(x=res.name, y=value)) +
+     geom_boxplot(aes(fill=res.name)) + 
+     scale_fill_brewer(name='Reservoir', palette='BuPu') +
+     scale_x_discrete(name='Reservoir', labels=res.labels) +
+     scale_y_continuous(name='Indicator value') +
+  facet_wrap(indicator ~ ., scale='free_y', ncol=2) 
+
+plot.file <- paste0(plot.path, 'ICA-plot2.jpg')
+ggsave(file=plot.file, P+theme_bw(22)+theme(legend.position='bottom'), dpi=300, width=12, height=10)
+print(paste0('Saved to ', plot.file))
+
+```
+
+
+Focus on four TVA reservoirs: Watts Bar (TN12102), Norris (TN01302), Guntersville (AL09501), Douglas (TN15501), and USACE reservoir Hartwell (GA01702) 
+
+
+```{r operate, echo=FALSE}
+
+
+
+source(paste0(prog.path, 'ReservoirFunctions.R'))
+Res.dt <- sim.year(Vmax=parms$V_GRanD_mcm, lookup.dt, Qin, Qout)
+
+# Update indicators related to geometry
+
+
+```
+
+
+```{r get-WBM-drivers, echo=FALSE}
+
+if (!exists('crossmap.wbm'))
+{
+   # WBM: 1980-2019
+   # Load cross-map and merged USGS-WBM time series data
+   wfile.gages <- paste0(share.path, 'Gauges-01min/crossmap.wbm.RDS')
+   cols <- c('CellID01min', 'Order01min', 'gage.id')
+   crossmap.gage.wbm <- readr::read_rds(file=wfile.gages) %>%
+    mutate(across(cols, as.factor)) %>% select(-site_no) 
+   wfile.dams <- paste0(share.path, 'Dams-01min/crossmap.wbm.RDS')
+   crossmap.dams.wbm <- readr::read_rds(file=wfile.dams) %>%
+       mutate(across(c(CellID01min, Order01min), as.factor))
+   
+   # merge wbm dams and gage samples 
+   #    to get GRanD_ID, DAM_NAME, Nameplate.MW
+   # should probably restrict to ROR operating dams in future
+   crossmap.wbm <- merge(crossmap.gage.wbm, crossmap.dams.wbm, by=c('CellID01min','Order01min'), all=TRUE) %>%
+     filter(!is.na(GRanD_ID))
+
+}
+ 
+```
+
+ 
+```{r load-WBM, echo=FALSE}
+
+# Load time seres pristine temp and in/outflow, all CONUS dams
+wfile <- paste0(share.path, 'Dams-01min/DOE-ACCESS-CM2/dTS-baseline-flow/wbm.ts.RDS')
+if (!exists('wbm.dt') & file.exists(wfile)) {
+   wbm.dt <- readr::read_rds(file=wfile)
+   wbm.dt <- wbm.dt %>% select(-SampleID)
+}
+
+```
+
+```{r test, echo=FALSE}
+
+res.list <- toupper(tva.names)
+tva.sf <- res.geom.dt %>% filter(RES_NAME %in% res.list) %>%
+    sf::st_as_sf(coords=c('Longitude','Latitude')) %>%
+	   st_set_crs(latlon.proj) 
+
+# Assuming elevation units are ft, www.tva.com/environment/lake-levels/douglas/operating-guide
+tva.full.pool <- c(0, 0, 0, 993, 0)
+tva.drawdown  <- c(0, 0, 0, 948, 0)
+tva.mid.elev  <- c(0, 0, 0, 970, 0)
+mid.fill.date <- c(0, 0, 0,  90, 0)
+mid.draw.date <- c(0, 0, 0, 290, 0)
+# all.GRanD_IDs <- levels(crossmap.wbm$GRanD_IDs)
+# all.NIDs <- levels(crossmap.wbm$NIDID)
+# test <- match(tva.NIDs, all.NIDs)
+
+#tva.crossmap.wbm <- crossmap.wbm[NIDID %in% tva.NIDs, ] %>% 
+   select(-c(BasinID01min, XCoord01min, YCoord01min, dv_tmp_begin_date, dv_tmp_end_date))
+
+# Subset time series data to five TVA reservoirs
+wbm.tva.dt <- merge(wbm.dt, tva.crossmap.wbm, by=c('CellID01min','uid'), all.x=FALSE) %>%
+  mutate(jday = lubridate::yday(Date), year = lubridate::year(Date))
+# & between(Date, start.time, end.time)
+wbm.tva.dt <- droplevels(wbm.tva.dt)
+
+# look at contents of time series data 
+# (if you want other identifiers merge wbm with tva.crossmap.wbm
+atable <- with(wbm.tva.dt, table(GRanD_ID, year))
+atable; # should be 365 or 366 days per year-site
+nres <- length(id.list)
+
+```
+
